@@ -13,7 +13,7 @@ Private, shared travel itineraries. Everything requires logging in. Each trip (`
 - Deleting: only the owner can delete a trip (from My trips or the trip page)
 - Rate limiting: 5 failed login or reset attempts per username, or 20 per IP, in 15 minutes → `429` with `Retry-After`
 - Home page lists **My trips** and **Shared with me**
-- Sharing: the owner invites, re-roles or removes members; members can leave. Anyone without access gets `404 Trip not found` (old `/e/` links redirect to `/t/`; old `/v/` links no longer work)
+- Sharing: the owner invites, re-roles or removes members; members can leave. Anyone without access gets `404 Trip not found` (old `/v/` links no longer work; for old `/e/` links see Legacy trips below)
 
 Stack: one Cloudflare Worker (`src/worker.js`, JSON API under `/api/trips`) + one vanilla page (`public/index.html`, `app.js`, `app.css`) + D1. Security headers (a strict Content-Security-Policy with no third-party scripts) are set in `public/_headers`; `npm run vendor` (run automatically by `wrangler dev`/`deploy` via the `build` step) copies MapLibre into the gitignored `public/vendor/`.
 
@@ -28,5 +28,12 @@ Deploying: run any new migrations with `npx wrangler d1 migrations apply travela
 Privacy: clicking or searching on the map sends the coordinates or search text (and the browser language) to OpenStreetMap Nominatim and Photon (komoot); map tiles come from OpenFreeMap.
 
 Before going public: Nominatim's usage policy only allows light use (≤1 request/second), and the public Photon server is shared and best-effort, so switch both to a paid or self-hosted geocoder.
+
+Legacy trips: trips made before accounts existed have no owner (`owner_id IS NULL`). Opening the trip's old `/e/<id>` edit link while logged in claims it (`POST /api/trips/:id/claim`): the first user to do so becomes its owner, since that link was the original proof of ownership. Plain `/t/<id>` never claims. Follow-up, after a grace period: delete unclaimed trips and make `owner_id` required.
+
+```sql
+-- DELETE FROM trips WHERE owner_id IS NULL;
+-- then rebuild trips with `owner_id INTEGER NOT NULL REFERENCES users(id)` (SQLite can't add NOT NULL in place)
+```
 
 Known limit: the whole trip saves as one blob, so simultaneous edits to different days still conflict.
