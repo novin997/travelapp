@@ -14,7 +14,13 @@ const MAX_FAILURES_PER_USER_ALL_IPS = 50;
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json", ...headers },
+    headers: {
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "strict-origin-when-cross-origin",
+      "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+      ...headers,
+    },
   });
 
 const toHex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
