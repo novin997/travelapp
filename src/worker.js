@@ -3,8 +3,11 @@ const SESSION_DAYS = 30;
 const PBKDF2_ITERATIONS = 100_000; // the maximum Workers allows
 const USERNAME_RE = /^[a-z0-9_]{3,32}$/;
 const FAILURE_WINDOW_MS = 15 * 60_000;
-const MAX_FAILURES_PER_USER = 5;
+const MAX_FAILURES_PER_USER = 5; // per (username, IP)
 const MAX_FAILURES_PER_IP = 20;
+// Per username across all IPs. High enough that a stranger can't cheaply lock someone out (it takes 50
+// guesses from 10+ IPs), low enough that a distributed guesser gets only 50 tries per 15 minutes.
+const MAX_FAILURES_PER_USER_ALL_IPS = 50;
 
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), {
@@ -80,29 +83,47 @@ async function readCredentials(request) {
 
 // ---------- rate limiting ----------
 
-const clientIp = (request) => request.headers.get("cf-connecting-ip") || "local";
-
-// Returns seconds until the oldest counted failure expires if any key is over its limit, else 0.
-async function lockedOutFor(env, limits) {
-  const since = Date.now() - FAILURE_WINDOW_MS;
-  for (const [key, max] of limits) {
-    const row = await env.DB.prepare(
-      "SELECT COUNT(*) AS n, MIN(at) AS oldest FROM auth_failures WHERE key = ? AND at > ?"
-    )
-      .bind(key, since)
-      .first();
-    if (row.n >= max) return Math.ceil((row.oldest + FAILURE_WINDOW_MS - Date.now()) / 1000);
-  }
-  return 0;
+// Cloudflare always sets cf-connecting-ip. Only local dev may lack it; anywhere else, refuse the request
+// rather than put every such client in one shared bucket.
+function clientIp(request) {
+  const ip = request.headers.get("cf-connecting-ip");
+  if (ip) return ip;
+  const host = new URL(request.url).hostname;
+  return host === "localhost" || host === "127.0.0.1" ? "local" : null;
 }
 
-async function recordFailure(env, keys) {
+const noClientIp = () => json({ error: "Could not identify client address" }, 400);
+
+// Records the attempt against every [key, max] *before* any password work, in one batch (D1 runs a batch
+// as a transaction), so parallel requests see each other's rows and can't all slip under the limit.
+// Returns the reserved row ids, plus seconds to wait if any key is now over its limit (the reservation
+// is then dropped, so rejected requests don't extend the lockout).
+async function reserveAttempt(env, limits) {
   const now = Date.now();
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM auth_failures WHERE at <= ?").bind(now - FAILURE_WINDOW_MS),
-    ...keys.map((key) => env.DB.prepare("INSERT INTO auth_failures (key, at) VALUES (?, ?)").bind(key, now)),
+  const since = now - FAILURE_WINDOW_MS;
+  const results = await env.DB.batch([
+    env.DB.prepare("DELETE FROM auth_failures WHERE at <= ?").bind(since),
+    ...limits.map(([key]) =>
+      env.DB.prepare("INSERT INTO auth_failures (key, at) VALUES (?, ?) RETURNING rowid AS id").bind(key, now)
+    ),
+    ...limits.map(([key]) =>
+      env.DB.prepare("SELECT COUNT(*) AS n, MIN(at) AS oldest FROM auth_failures WHERE key = ? AND at > ?").bind(
+        key,
+        since
+      )
+    ),
   ]);
+  const ids = results.slice(1, 1 + limits.length).map((r) => r.results[0].id);
+  const counts = results.slice(1 + limits.length).map((r) => r.results[0]);
+  const over = counts.filter((row, i) => row.n > limits[i][1]);
+  if (!over.length) return { ids, wait: 0 };
+  await unreserve(env, ids).run();
+  return { ids, wait: Math.max(...over.map((row) => Math.ceil((row.oldest + FAILURE_WINDOW_MS - now) / 1000))) };
 }
+
+// A reserved attempt that turned out not to be a failure. A failure simply leaves its rows in place.
+const unreserve = (env, ids) =>
+  env.DB.prepare(`DELETE FROM auth_failures WHERE rowid IN (${ids.map(() => "?").join()})`).bind(...ids);
 
 function tooManyAttempts(seconds) {
   const minutes = Math.ceil(seconds / 60);
@@ -151,19 +172,27 @@ async function signup(request, env) {
 
 async function login(request, env) {
   const { username, password } = await readCredentials(request);
+  const ip = clientIp(request);
+  if (!ip) return noClientIp();
   const userKey = "user:" + username;
-  const ipKey = "ip:" + clientIp(request);
-  const wait = await lockedOutFor(env, [[userKey, MAX_FAILURES_PER_USER], [ipKey, MAX_FAILURES_PER_IP]]);
+  const pairKey = userKey + "@" + ip;
+  const { ids, wait } = await reserveAttempt(env, [
+    [pairKey, MAX_FAILURES_PER_USER],
+    [userKey, MAX_FAILURES_PER_USER_ALL_IPS],
+    ["ip:" + ip, MAX_FAILURES_PER_IP],
+  ]);
   if (wait) return tooManyAttempts(wait);
 
   const user = await env.DB.prepare("SELECT id, username, password_hash, salt FROM users WHERE username = ?")
     .bind(username)
     .first();
   if (!user || !sameHex(await hashPassword(password, user.salt), user.password_hash)) {
-    await recordFailure(env, [userKey, ipKey]);
     return json({ error: "Wrong username or password" }, 401);
   }
-  await env.DB.prepare("DELETE FROM auth_failures WHERE key = ?").bind(userKey).run();
+  await env.DB.batch([
+    unreserve(env, ids),
+    env.DB.prepare("DELETE FROM auth_failures WHERE key IN (?, ?)").bind(pairKey, userKey),
+  ]);
   return startSession(request, env, user);
 }
 
@@ -172,19 +201,27 @@ async function resetPassword(request, env) {
   const { username, code, password } = await request.json().catch(() => ({}));
   const name = String(username || "").trim().toLowerCase();
   const newPassword = String(password || "");
+  const ip = clientIp(request);
+  if (!ip) return noClientIp();
   const userKey = "reset:" + name;
-  const ipKey = "ip:" + clientIp(request);
-  const wait = await lockedOutFor(env, [[userKey, MAX_FAILURES_PER_USER], [ipKey, MAX_FAILURES_PER_IP]]);
+  const pairKey = userKey + "@" + ip;
+  const { ids, wait } = await reserveAttempt(env, [
+    [pairKey, MAX_FAILURES_PER_USER],
+    [userKey, MAX_FAILURES_PER_USER_ALL_IPS],
+    ["ip:" + ip, MAX_FAILURES_PER_IP],
+  ]);
   if (wait) return tooManyAttempts(wait);
 
   const user = await env.DB.prepare("SELECT id, username, recovery_hash FROM users WHERE username = ?")
     .bind(name)
     .first();
   if (!user || !user.recovery_hash || !sameHex(await sha256(normalizeCode(code)), user.recovery_hash)) {
-    await recordFailure(env, [userKey, ipKey]);
     return json({ error: "Wrong username or recovery code" }, 401);
   }
-  if (passwordError(newPassword)) return json({ error: passwordError(newPassword) }, 400);
+  if (passwordError(newPassword)) {
+    await unreserve(env, ids).run();
+    return json({ error: passwordError(newPassword) }, 400);
+  }
 
   const salt = toHex(crypto.getRandomValues(new Uint8Array(16)));
   const recoveryCode = newRecoveryCode();
@@ -196,7 +233,13 @@ async function resetPassword(request, env) {
       user.id
     ),
     env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(user.id),
-    env.DB.prepare("DELETE FROM auth_failures WHERE key IN (?, ?)").bind(userKey, "user:" + name),
+    unreserve(env, ids),
+    env.DB.prepare("DELETE FROM auth_failures WHERE key IN (?, ?, ?, ?)").bind(
+      pairKey,
+      userKey,
+      "user:" + name + "@" + ip,
+      "user:" + name
+    ),
   ]);
   return startSession(request, env, user, { recoveryCode });
 }
@@ -204,19 +247,22 @@ async function resetPassword(request, env) {
 // Logged in: confirm the password to replace a lost recovery code.
 async function regenerateRecoveryCode(request, env, user) {
   const { password } = await request.json().catch(() => ({}));
-  const userKey = "user:" + user.username;
-  const wait = await lockedOutFor(env, [[userKey, MAX_FAILURES_PER_USER]]);
+  // Only this user's own sessions can reach here, so a per-user key can't be used to lock them out.
+  const { ids, wait } = await reserveAttempt(env, [["regen:" + user.username, MAX_FAILURES_PER_USER]]);
   if (wait) return tooManyAttempts(wait);
 
   const row = await env.DB.prepare("SELECT password_hash, salt FROM users WHERE id = ?").bind(user.id).first();
   if (!sameHex(await hashPassword(String(password || ""), row.salt), row.password_hash)) {
-    await recordFailure(env, [userKey]);
     return json({ error: "Wrong password" }, 401);
   }
   const recoveryCode = newRecoveryCode();
-  await env.DB.prepare("UPDATE users SET recovery_hash = ? WHERE id = ?")
-    .bind(await sha256(normalizeCode(recoveryCode)), user.id)
-    .run();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE users SET recovery_hash = ? WHERE id = ?").bind(
+      await sha256(normalizeCode(recoveryCode)),
+      user.id
+    ),
+    unreserve(env, ids),
+  ]);
   return json({ recoveryCode });
 }
 
