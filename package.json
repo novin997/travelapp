@@ -3,10 +3,14 @@
   "private": true,
   "scripts": {
     "db:local": "wrangler d1 migrations apply travelapp --local",
+    "vendor": "mkdir -p public/vendor/maplibre-gl && cd node_modules/maplibre-gl/dist && cp maplibre-gl.mjs maplibre-gl-shared.mjs maplibre-gl-worker.mjs maplibre-gl.css ../../../public/vendor/maplibre-gl/",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.147.0"
+  },
+  "dependencies": {
+    "maplibre-gl": "6.12.0"
   }
 }
