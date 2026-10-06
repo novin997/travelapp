@@ -11,6 +11,15 @@ export default defineConfig(async () => {
         miniflare: { bindings: { TEST_MIGRATIONS: migrations } },
       }),
     ],
-    test: { setupFiles: ["./test/apply-migrations.js"] },
+    test: {
+      setupFiles: ["./test/apply-migrations.js"],
+      // Workers have no V8 coverage, so instrument with istanbul. `npm run coverage` fails below 80%.
+      coverage: {
+        provider: "istanbul",
+        include: ["src/**"],
+        reporter: ["text", "html"],
+        thresholds: { statements: 80, branches: 80, functions: 80, lines: 80 },
+      },
+    },
   };
 });

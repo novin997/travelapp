@@ -22,6 +22,7 @@ npm install
 npm run db:local   # create/upgrade local D1 tables
 npm run dev        # http://localhost:8787
 npm test           # Worker tests (vitest-pool-workers, fresh D1 with migrations/ applied)
+npm run coverage   # same, plus coverage of src/ (fails below 80%; HTML report in coverage/)
 ```
 
 Deploying: run any new migrations with `npx wrangler d1 migrations apply travelapp --remote`, then `npm run deploy`.
