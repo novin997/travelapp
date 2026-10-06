@@ -112,7 +112,7 @@ async function deleteTrip(id, title) {
 // Where to go after logging in: back to the trip that sent you to the login page, if any.
 function nextTrip() {
   const next = new URLSearchParams(location.search).get("next");
-  return next && /^\/t\/[0-9a-f]{32}$/.test(next) ? next : null;
+  return next && /^\/[te]\/[0-9a-f]{32}$/.test(next) ? next : null;
 }
 
 // ---------- home ----------
@@ -289,6 +289,14 @@ async function save() {
     saving = false;
     if (pendingSave) { pendingSave = false; save(); }
   }
+}
+
+// Old /e/ links can claim a trip made before accounts existed; otherwise this is a no-op.
+async function claimTrip(t) {
+  const res = await fetch(`/api/trips/${t}/claim`, { method: "POST" });
+  if (res.status === 401) { location.href = "/?next=" + encodeURIComponent("/e/" + t); return; }
+  history.replaceState(null, "", tripUrl(t));
+  loadTrip(t);
 }
 
 async function loadTrip(t) {
@@ -666,9 +674,9 @@ function addPickedStop() {
 
 // ---------- router ----------
 const [, mode, t] = location.pathname.split("/");
-if ((mode === "t" || mode === "e") && t) {
-  // Old /e/ edit links now point at the trip's page; access still needs login and an invite.
-  if (mode === "e") history.replaceState(null, "", tripUrl(t));
+if (mode === "e" && t) {
+  claimTrip(t);
+} else if (mode === "t" && t) {
   loadTrip(t);
 } else if (mode === "v" && t) {
   app.replaceChildren(el("h1", {}, "View links no longer work"),
