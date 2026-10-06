@@ -1,12 +1,24 @@
 {
   "name": "travelapp",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "db:local": "wrangler d1 migrations apply travelapp --local",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "vitest run"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "vitest": "~4.1.11",
     "wrangler": "^4.147.0"
+  },
+  "overrides": {
+    "@cloudflare/vitest-pool-workers": {
+      "wrangler": "$wrangler",
+      "miniflare": "5.20261001.0-alpha"
+    }
   }
 }
