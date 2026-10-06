@@ -1,0 +1,6 @@
+CREATE TABLE trips (
+  edit_token TEXT PRIMARY KEY,
+  view_token TEXT NOT NULL UNIQUE,
+  data TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1
+);

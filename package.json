@@ -1,0 +1,12 @@
+{
+  "name": "travelapp",
+  "private": true,
+  "scripts": {
+    "db:local": "wrangler d1 migrations apply travelapp --local",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.147.0"
+  }
+}
