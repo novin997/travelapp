@@ -256,7 +256,7 @@ async function myTrips(user, env) {
             COALESCE(trip_members.role, 'owner') AS role, owners.username AS owner
      FROM trips
      LEFT JOIN trip_members ON trip_members.trip_id = trips.edit_token AND trip_members.user_id = ?1
-     JOIN users AS owners ON owners.id = trips.owner_id
+     LEFT JOIN users AS owners ON owners.id = trips.owner_id
      WHERE trips.owner_id = ?1 OR trip_members.user_id = ?1
      ORDER BY trips.created_at DESC`
   )
@@ -300,7 +300,7 @@ const tripNotFound = () => json({ error: "Trip not found" }, 404);
 
 async function getTrip(env, tripId, user, role) {
   const trip = await env.DB.prepare(
-    "SELECT trips.data, trips.version, users.username AS owner FROM trips JOIN users ON users.id = trips.owner_id WHERE edit_token = ?"
+    "SELECT trips.data, trips.version, users.username AS owner FROM trips LEFT JOIN users ON users.id = trips.owner_id WHERE edit_token = ?"
   )
     .bind(tripId)
     .first();
@@ -339,6 +339,17 @@ async function saveTrip(request, env, tripId) {
   return json({ version: version + 1 });
 }
 
+// Trips made before accounts have no owner. The old /e/ link was their proof of ownership,
+// so the first logged-in user to present it becomes the owner. Already owned looks like not found.
+async function claimTrip(env, tripId, user) {
+  const result = await env.DB.prepare(
+    "UPDATE trips SET owner_id = ?, created_at = COALESCE(created_at, ?) WHERE edit_token = ? AND owner_id IS NULL"
+  )
+    .bind(user.id, Date.now(), tripId)
+    .run();
+  return result.meta.changes ? json({ id: tripId }) : tripNotFound();
+}
+
 async function deleteTrip(env, tripId) {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM trip_members WHERE trip_id = ?").bind(tripId),
@@ -373,10 +384,11 @@ async function removeMember(env, tripId, username) {
   return json({ ok: true });
 }
 
-// Every /api/trips/:id route requires login and a role on that trip.
+// Every /api/trips/:id route requires login and, except claiming, a role on that trip.
 async function tripRoute(request, env, tripId, rest) {
   const user = await currentUser(request, env);
   if (!user) return json({ error: "Log in first" }, 401);
+  if (rest === "/claim" && request.method === "POST") return claimTrip(env, tripId, user);
   const role = await tripRole(env, tripId, user);
   if (!role) return tripNotFound();
   const method = request.method;
