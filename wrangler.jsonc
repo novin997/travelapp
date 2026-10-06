@@ -3,6 +3,8 @@
   "name": "travelapp",
   "main": "src/worker.js",
   "compatibility_date": "2026-10-01",
+  // Copies MapLibre from node_modules into public/vendor/ before every dev/deploy, so it is served same-origin
+  "build": { "command": "npm run vendor" },
   "assets": {
     "directory": "./public",
     "not_found_handling": "single-page-application",

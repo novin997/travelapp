@@ -5,7 +5,7 @@
 Private, shared travel itineraries. Everything requires logging in. Each trip (`/t/<id>`) can be opened only by its owner and the users they invite by username as **Editor** or **Viewer**.
 
 - Days (Day 1…N), each with ordered stops (optional `HH:MM` time + free-text place) and a notes box
-- **Pick on map**: a 2D map (MapLibre 6 from unpkg, OpenFreeMap tiles) where clicking drops a pin, the name is filled in from OpenStreetMap Nominatim reverse geocoding, and the stop is saved with its coordinates (`lat`, `lng`). Mapped stops link to exact coordinates in Google Maps
+- **Pick on map**: a 2D map (MapLibre 6, pinned in `package.json` and served from this origin under `/vendor/`, OpenFreeMap tiles) where clicking drops a pin, the name is filled in from OpenStreetMap Nominatim reverse geocoding, and the stop is saved with its coordinates (`lat`, `lng`). Mapped stops link to exact coordinates in Google Maps
 - **Search on the map**: type a place name to search with [Photon](https://photon.komoot.io) (OpenStreetMap data, results near the current view first); picking a result flies there and drops the pin
 - Auto-saves ~1s after each edit. If someone else saved first, you're asked to reload (version check in `UPDATE … WHERE version = ?`)
 - Accounts: username + password (PBKDF2-SHA256, per-user salt), 30-day HttpOnly session cookie
@@ -15,7 +15,7 @@ Private, shared travel itineraries. Everything requires logging in. Each trip (`
 - Home page lists **My trips** and **Shared with me**
 - Sharing: the owner invites, re-roles or removes members; members can leave. Anyone without access gets `404 Trip not found` (old `/v/` links no longer work; for old `/e/` links see Legacy trips below)
 
-Stack: one Cloudflare Worker (`src/worker.js`, JSON API under `/api/trips`) + one vanilla HTML page (`public/index.html`) + D1.
+Stack: one Cloudflare Worker (`src/worker.js`, JSON API under `/api/trips`) + one vanilla page (`public/index.html`, `app.js`, `app.css`) + D1. Security headers (a strict Content-Security-Policy with no third-party scripts) are set in `public/_headers`; `npm run vendor` (run automatically by `wrangler dev`/`deploy` via the `build` step) copies MapLibre into the gitignored `public/vendor/`.
 
 ```sh
 npm install
@@ -26,6 +26,8 @@ npm run coverage   # same, plus coverage of src/ (fails below 80%; HTML report i
 ```
 
 Deploying: run any new migrations with `npx wrangler d1 migrations apply travelapp --remote`, then `npm run deploy`.
+
+Privacy: clicking or searching on the map sends the coordinates or search text (and the browser language) to OpenStreetMap Nominatim and Photon (komoot); map tiles come from OpenFreeMap.
 
 Before going public: Nominatim's usage policy only allows light use (≤1 request/second), and the public Photon server is shared and best-effort, so switch both to a paid or self-hosted geocoder.
 
