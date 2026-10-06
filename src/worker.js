@@ -1,10 +1,15 @@
 const MAX_BYTES = 100_000;
+const MAX_TITLE = 200;
+const TIME_RE = /^(?:[01]\d|2[0-3]):[0-5]\d$|^$/; // what <input type=time> produces, or empty
 const SESSION_DAYS = 30;
 const PBKDF2_ITERATIONS = 100_000; // the maximum Workers allows
 const USERNAME_RE = /^[a-z0-9_]{3,32}$/;
 const FAILURE_WINDOW_MS = 15 * 60_000;
-const MAX_FAILURES_PER_USER = 5;
+const MAX_FAILURES_PER_USER = 5; // per (username, IP)
 const MAX_FAILURES_PER_IP = 20;
+// Per username across all IPs. High enough that a stranger can't cheaply lock someone out (it takes 50
+// guesses from 10+ IPs), low enough that a distributed guesser gets only 50 tries per 15 minutes.
+const MAX_FAILURES_PER_USER_ALL_IPS = 50;
 
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), {
@@ -86,29 +91,47 @@ async function readCredentials(request) {
 
 // ---------- rate limiting ----------
 
-const clientIp = (request) => request.headers.get("cf-connecting-ip") || "local";
-
-// Returns seconds until the oldest counted failure expires if any key is over its limit, else 0.
-async function lockedOutFor(env, limits) {
-  const since = Date.now() - FAILURE_WINDOW_MS;
-  for (const [key, max] of limits) {
-    const row = await env.DB.prepare(
-      "SELECT COUNT(*) AS n, MIN(at) AS oldest FROM auth_failures WHERE key = ? AND at > ?"
-    )
-      .bind(key, since)
-      .first();
-    if (row.n >= max) return Math.ceil((row.oldest + FAILURE_WINDOW_MS - Date.now()) / 1000);
-  }
-  return 0;
+// Cloudflare always sets cf-connecting-ip. Only local dev may lack it; anywhere else, refuse the request
+// rather than put every such client in one shared bucket.
+function clientIp(request) {
+  const ip = request.headers.get("cf-connecting-ip");
+  if (ip) return ip;
+  const host = new URL(request.url).hostname;
+  return host === "localhost" || host === "127.0.0.1" ? "local" : null;
 }
 
-async function recordFailure(env, keys) {
+const noClientIp = () => json({ error: "Could not identify client address" }, 400);
+
+// Records the attempt against every [key, max] *before* any password work, in one batch (D1 runs a batch
+// as a transaction), so parallel requests see each other's rows and can't all slip under the limit.
+// Returns the reserved row ids, plus seconds to wait if any key is now over its limit (the reservation
+// is then dropped, so rejected requests don't extend the lockout).
+async function reserveAttempt(env, limits) {
   const now = Date.now();
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM auth_failures WHERE at <= ?").bind(now - FAILURE_WINDOW_MS),
-    ...keys.map((key) => env.DB.prepare("INSERT INTO auth_failures (key, at) VALUES (?, ?)").bind(key, now)),
+  const since = now - FAILURE_WINDOW_MS;
+  const results = await env.DB.batch([
+    env.DB.prepare("DELETE FROM auth_failures WHERE at <= ?").bind(since),
+    ...limits.map(([key]) =>
+      env.DB.prepare("INSERT INTO auth_failures (key, at) VALUES (?, ?) RETURNING rowid AS id").bind(key, now)
+    ),
+    ...limits.map(([key]) =>
+      env.DB.prepare("SELECT COUNT(*) AS n, MIN(at) AS oldest FROM auth_failures WHERE key = ? AND at > ?").bind(
+        key,
+        since
+      )
+    ),
   ]);
+  const ids = results.slice(1, 1 + limits.length).map((r) => r.results[0].id);
+  const counts = results.slice(1 + limits.length).map((r) => r.results[0]);
+  const over = counts.filter((row, i) => row.n > limits[i][1]);
+  if (!over.length) return { ids, wait: 0 };
+  await unreserve(env, ids).run();
+  return { ids, wait: Math.max(...over.map((row) => Math.ceil((row.oldest + FAILURE_WINDOW_MS - now) / 1000))) };
 }
+
+// A reserved attempt that turned out not to be a failure. A failure simply leaves its rows in place.
+const unreserve = (env, ids) =>
+  env.DB.prepare(`DELETE FROM auth_failures WHERE rowid IN (${ids.map(() => "?").join()})`).bind(...ids);
 
 function tooManyAttempts(seconds) {
   const minutes = Math.ceil(seconds / 60);
@@ -133,7 +156,9 @@ function newRecoveryCode() {
 const normalizeCode = (code) => String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 const passwordError = (password) =>
-  password.length < 8 || password.length > 200 ? "Password must be at least 8 characters" : null;
+  password.length < 8 ? "Password must be at least 8 characters"
+  : password.length > 200 ? "Password must be at most 200 characters"
+  : null;
 
 // ---------- account routes ----------
 
@@ -157,19 +182,27 @@ async function signup(request, env) {
 
 async function login(request, env) {
   const { username, password } = await readCredentials(request);
+  const ip = clientIp(request);
+  if (!ip) return noClientIp();
   const userKey = "user:" + username;
-  const ipKey = "ip:" + clientIp(request);
-  const wait = await lockedOutFor(env, [[userKey, MAX_FAILURES_PER_USER], [ipKey, MAX_FAILURES_PER_IP]]);
+  const pairKey = userKey + "@" + ip;
+  const { ids, wait } = await reserveAttempt(env, [
+    [pairKey, MAX_FAILURES_PER_USER],
+    [userKey, MAX_FAILURES_PER_USER_ALL_IPS],
+    ["ip:" + ip, MAX_FAILURES_PER_IP],
+  ]);
   if (wait) return tooManyAttempts(wait);
 
   const user = await env.DB.prepare("SELECT id, username, password_hash, salt FROM users WHERE username = ?")
     .bind(username)
     .first();
   if (!user || !sameHex(await hashPassword(password, user.salt), user.password_hash)) {
-    await recordFailure(env, [userKey, ipKey]);
     return json({ error: "Wrong username or password" }, 401);
   }
-  await env.DB.prepare("DELETE FROM auth_failures WHERE key = ?").bind(userKey).run();
+  await env.DB.batch([
+    unreserve(env, ids),
+    env.DB.prepare("DELETE FROM auth_failures WHERE key IN (?, ?)").bind(pairKey, userKey),
+  ]);
   return startSession(request, env, user);
 }
 
@@ -178,19 +211,27 @@ async function resetPassword(request, env) {
   const { username, code, password } = await request.json().catch(() => ({}));
   const name = String(username || "").trim().toLowerCase();
   const newPassword = String(password || "");
+  const ip = clientIp(request);
+  if (!ip) return noClientIp();
   const userKey = "reset:" + name;
-  const ipKey = "ip:" + clientIp(request);
-  const wait = await lockedOutFor(env, [[userKey, MAX_FAILURES_PER_USER], [ipKey, MAX_FAILURES_PER_IP]]);
+  const pairKey = userKey + "@" + ip;
+  const { ids, wait } = await reserveAttempt(env, [
+    [pairKey, MAX_FAILURES_PER_USER],
+    [userKey, MAX_FAILURES_PER_USER_ALL_IPS],
+    ["ip:" + ip, MAX_FAILURES_PER_IP],
+  ]);
   if (wait) return tooManyAttempts(wait);
 
   const user = await env.DB.prepare("SELECT id, username, recovery_hash FROM users WHERE username = ?")
     .bind(name)
     .first();
   if (!user || !user.recovery_hash || !sameHex(await sha256(normalizeCode(code)), user.recovery_hash)) {
-    await recordFailure(env, [userKey, ipKey]);
     return json({ error: "Wrong username or recovery code" }, 401);
   }
-  if (passwordError(newPassword)) return json({ error: passwordError(newPassword) }, 400);
+  if (passwordError(newPassword)) {
+    await unreserve(env, ids).run();
+    return json({ error: passwordError(newPassword) }, 400);
+  }
 
   const salt = toHex(crypto.getRandomValues(new Uint8Array(16)));
   const recoveryCode = newRecoveryCode();
@@ -202,7 +243,13 @@ async function resetPassword(request, env) {
       user.id
     ),
     env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(user.id),
-    env.DB.prepare("DELETE FROM auth_failures WHERE key IN (?, ?)").bind(userKey, "user:" + name),
+    unreserve(env, ids),
+    env.DB.prepare("DELETE FROM auth_failures WHERE key IN (?, ?, ?, ?)").bind(
+      pairKey,
+      userKey,
+      "user:" + name + "@" + ip,
+      "user:" + name
+    ),
   ]);
   return startSession(request, env, user, { recoveryCode });
 }
@@ -210,19 +257,22 @@ async function resetPassword(request, env) {
 // Logged in: confirm the password to replace a lost recovery code.
 async function regenerateRecoveryCode(request, env, user) {
   const { password } = await request.json().catch(() => ({}));
-  const userKey = "user:" + user.username;
-  const wait = await lockedOutFor(env, [[userKey, MAX_FAILURES_PER_USER]]);
+  // Only this user's own sessions can reach here, so a per-user key can't be used to lock them out.
+  const { ids, wait } = await reserveAttempt(env, [["regen:" + user.username, MAX_FAILURES_PER_USER]]);
   if (wait) return tooManyAttempts(wait);
 
   const row = await env.DB.prepare("SELECT password_hash, salt FROM users WHERE id = ?").bind(user.id).first();
   if (!sameHex(await hashPassword(String(password || ""), row.salt), row.password_hash)) {
-    await recordFailure(env, [userKey]);
     return json({ error: "Wrong password" }, 401);
   }
   const recoveryCode = newRecoveryCode();
-  await env.DB.prepare("UPDATE users SET recovery_hash = ? WHERE id = ?")
-    .bind(await sha256(normalizeCode(recoveryCode)), user.id)
-    .run();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE users SET recovery_hash = ? WHERE id = ?").bind(
+      await sha256(normalizeCode(recoveryCode)),
+      user.id
+    ),
+    unreserve(env, ids),
+  ]);
   return json({ recoveryCode });
 }
 
@@ -234,25 +284,28 @@ async function logout(request, env) {
 
 // ---------- trip routes ----------
 
-function validTrip(data) {
-  return (
-    data &&
-    typeof data.title === "string" &&
-    Array.isArray(data.days) &&
-    data.days.every(
-      (d) =>
-        typeof d.notes === "string" &&
-        Array.isArray(d.stops) &&
-        d.stops.every(
-          (s) =>
-            typeof s.location === "string" &&
-            typeof s.time === "string" &&
-            // Map-picked stops carry coordinates; typed-in stops don't.
-            (s.lat === undefined || (typeof s.lat === "number" && Math.abs(s.lat) <= 90)) &&
-            (s.lng === undefined || (typeof s.lng === "number" && Math.abs(s.lng) <= 180))
-        )
-    )
-  );
+const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
+const inRange = (n, max) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= max;
+
+// Map-picked stops carry coordinates; typed-in stops don't.
+function cleanStop(s) {
+  if (!isObj(s) || typeof s.location !== "string" || typeof s.time !== "string" || !TIME_RE.test(s.time)) return null;
+  const stop = { time: s.time, location: s.location };
+  if (s.lat === undefined && s.lng === undefined) return stop;
+  return inRange(s.lat, 90) && inRange(s.lng, 180) ? { ...stop, lat: s.lat, lng: s.lng } : null;
+}
+
+function cleanDay(d) {
+  if (!isObj(d) || typeof d.notes !== "string" || !Array.isArray(d.stops)) return null;
+  const stops = d.stops.map(cleanStop);
+  return stops.includes(null) ? null : { notes: d.notes, stops };
+}
+
+// Returns a copy with only the known fields, or null if anything is malformed.
+function cleanTrip(data) {
+  if (!isObj(data) || typeof data.title !== "string" || data.title.length > MAX_TITLE || !Array.isArray(data.days)) return null;
+  const days = data.days.map(cleanDay);
+  return days.includes(null) ? null : { title: data.title, days };
 }
 
 // Trips the user owns, plus trips they've been invited to.
@@ -262,7 +315,7 @@ async function myTrips(user, env) {
             COALESCE(trip_members.role, 'owner') AS role, owners.username AS owner
      FROM trips
      LEFT JOIN trip_members ON trip_members.trip_id = trips.edit_token AND trip_members.user_id = ?1
-     JOIN users AS owners ON owners.id = trips.owner_id
+     LEFT JOIN users AS owners ON owners.id = trips.owner_id
      WHERE trips.owner_id = ?1 OR trip_members.user_id = ?1
      ORDER BY trips.created_at DESC`
   )
@@ -274,7 +327,7 @@ async function myTrips(user, env) {
 async function createTrip(request, env, user) {
   const { title } = await request.json().catch(() => ({}));
   const data = {
-    title: String(title || "Untitled trip").slice(0, 200),
+    title: String(title || "Untitled trip").slice(0, MAX_TITLE),
     days: [{ notes: "", stops: [] }],
   };
   const id = newToken();
@@ -306,7 +359,7 @@ const tripNotFound = () => json({ error: "Trip not found" }, 404);
 
 async function getTrip(env, tripId, user, role) {
   const trip = await env.DB.prepare(
-    "SELECT trips.data, trips.version, users.username AS owner FROM trips JOIN users ON users.id = trips.owner_id WHERE edit_token = ?"
+    "SELECT trips.data, trips.version, users.username AS owner FROM trips LEFT JOIN users ON users.id = trips.owner_id WHERE edit_token = ?"
   )
     .bind(tripId)
     .first();
@@ -328,14 +381,15 @@ async function getTrip(env, tripId, user, role) {
 
 // Save: only succeeds if nobody else saved since this client loaded `version`.
 async function saveTrip(request, env, tripId) {
+  const tooLarge = () => json({ error: "Trip too large" }, 413);
+  if (Number(request.headers.get("content-length")) > MAX_BYTES) return tooLarge();
   const body = await request.text();
-  if (body.length > MAX_BYTES) return json({ error: "Trip too large" }, 413);
+  if (new TextEncoder().encode(body).length > MAX_BYTES) return tooLarge();
   let parsed;
   try { parsed = JSON.parse(body); } catch { return json({ error: "Invalid trip" }, 400); }
-  const { data, version } = parsed || {};
-  if (!validTrip(data) || !Number.isInteger(version)) {
-    return json({ error: "Invalid trip" }, 400);
-  }
+  const { data: raw, version } = parsed || {};
+  const data = cleanTrip(raw);
+  if (!data || !Number.isInteger(version)) return json({ error: "Invalid trip" }, 400);
   const result = await env.DB.prepare(
     "UPDATE trips SET data = ?, version = version + 1 WHERE edit_token = ? AND version = ?"
   )
@@ -343,6 +397,17 @@ async function saveTrip(request, env, tripId) {
     .run();
   if (result.meta.changes === 0) return json({ error: "Someone else changed this trip" }, 409);
   return json({ version: version + 1 });
+}
+
+// Trips made before accounts have no owner. The old /e/ link was their proof of ownership,
+// so the first logged-in user to present it becomes the owner. Already owned looks like not found.
+async function claimTrip(env, tripId, user) {
+  const result = await env.DB.prepare(
+    "UPDATE trips SET owner_id = ?, created_at = COALESCE(created_at, ?) WHERE edit_token = ? AND owner_id IS NULL"
+  )
+    .bind(user.id, Date.now(), tripId)
+    .run();
+  return result.meta.changes ? json({ id: tripId }) : tripNotFound();
 }
 
 async function deleteTrip(env, tripId) {
@@ -379,10 +444,11 @@ async function removeMember(env, tripId, username) {
   return json({ ok: true });
 }
 
-// Every /api/trips/:id route requires login and a role on that trip.
+// Every /api/trips/:id route requires login and, except claiming, a role on that trip.
 async function tripRoute(request, env, tripId, rest) {
   const user = await currentUser(request, env);
   if (!user) return json({ error: "Log in first" }, 401);
+  if (rest === "/claim" && request.method === "POST") return claimTrip(env, tripId, user);
   const role = await tripRole(env, tripId, user);
   if (!role) return tripNotFound();
   const method = request.method;

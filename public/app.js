@@ -30,7 +30,7 @@ async function deleteTrip(id, title) {
 // Where to go after logging in: back to the trip that sent you to the login page, if any.
 function nextTrip() {
   const next = new URLSearchParams(location.search).get("next");
-  return next && /^\/t\/[0-9a-f]{32}$/.test(next) ? next : null;
+  return next && /^\/[te]\/[0-9a-f]{32}$/.test(next) ? next : null;
 }
 
 // ---------- home ----------
@@ -114,7 +114,7 @@ async function renderDashboard(username) {
   const trips = await (await fetch("/api/my-trips")).json();
   const owned = trips.filter((t) => t.role === "owner");
   const shared = trips.filter((t) => t.role !== "owner");
-  const title = el("input", { placeholder: "Trip name, e.g. Tokyo in spring" });
+  const title = el("input", { placeholder: "Trip name, e.g. Tokyo in spring", maxLength: 200 });
   const create = async (e) => {
     e.preventDefault();
     const res = await postJson("/api/trips", { title: title.value.trim() });
@@ -209,6 +209,14 @@ async function save() {
   }
 }
 
+// Old /e/ links can claim a trip made before accounts existed; otherwise this is a no-op.
+async function claimTrip(t) {
+  const res = await fetch(`/api/trips/${t}/claim`, { method: "POST" });
+  if (res.status === 401) { location.href = "/?next=" + encodeURIComponent("/e/" + t); return; }
+  history.replaceState(null, "", tripUrl(t));
+  loadTrip(t);
+}
+
 async function loadTrip(t) {
   token = t;
   const res = await fetch("/api/trips/" + t);
@@ -238,7 +246,7 @@ function renderTrip() {
     ? [
         el("p", {}, el("a", { href: "/" }, "← All trips")),
         el("input", {
-          className: "title-input", value: data.title, disabled: locked, placeholder: "Trip name",
+          className: "title-input", value: data.title, maxLength: 200, disabled: locked, placeholder: "Trip name",
           oninput: (e) => { data.title = e.target.value; document.title = data.title; scheduleSave(); },
         }),
         sharedByLine(),
@@ -584,9 +592,9 @@ function addPickedStop() {
 
 // ---------- router ----------
 const [, mode, t] = location.pathname.split("/");
-if ((mode === "t" || mode === "e") && t) {
-  // Old /e/ edit links now point at the trip's page; access still needs login and an invite.
-  if (mode === "e") history.replaceState(null, "", tripUrl(t));
+if (mode === "e" && t) {
+  claimTrip(t);
+} else if (mode === "t" && t) {
   loadTrip(t);
 } else if (mode === "v" && t) {
   app.replaceChildren(el("h1", {}, "View links no longer work"),
