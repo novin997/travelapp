@@ -6,11 +6,12 @@ const BASE = "http://travelapp.test";
 export const uniq = (prefix = "u") => `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 export const newIp = () => `10.${[0, 0, 0].map(() => Math.floor(Math.random() * 256)).join(".")}`;
 
-export function api(path, { method = "GET", body, cookie, ip, raw } = {}) {
-  const headers = { "cf-connecting-ip": ip || newIp() };
+// `ip: null` sends no cf-connecting-ip; `base` overrides the origin (e.g. https, localhost).
+export function api(path, { method = "GET", body, cookie, ip, raw, base = BASE } = {}) {
+  const headers = ip === null ? {} : { "cf-connecting-ip": ip || newIp() };
   if (cookie) headers.cookie = cookie;
   if (body !== undefined) headers["content-type"] = "application/json";
-  return exports.default.fetch(`${BASE}${path}`, {
+  return exports.default.fetch(`${base}${path}`, {
     method,
     headers,
     body: raw !== undefined ? raw : body === undefined ? undefined : JSON.stringify(body),

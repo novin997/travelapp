@@ -8,10 +8,12 @@
     "db:local": "wrangler d1 migrations apply travelapp --local",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "vitest run"
+    "test": "vitest run",
+    "coverage": "vitest run --coverage"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@vitest/coverage-istanbul": "~4.1.11",
     "vitest": "~4.1.11",
     "wrangler": "^4.147.0"
   },
