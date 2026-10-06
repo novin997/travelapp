@@ -1,4 +1,6 @@
 const MAX_BYTES = 100_000;
+const MAX_TITLE = 200;
+const TIME_RE = /^(?:[01]\d|2[0-3]):[0-5]\d$|^$/; // what <input type=time> produces, or empty
 const SESSION_DAYS = 30;
 const PBKDF2_ITERATIONS = 100_000; // the maximum Workers allows
 const USERNAME_RE = /^[a-z0-9_]{3,32}$/;
@@ -127,7 +129,9 @@ function newRecoveryCode() {
 const normalizeCode = (code) => String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 const passwordError = (password) =>
-  password.length < 8 || password.length > 200 ? "Password must be at least 8 characters" : null;
+  password.length < 8 ? "Password must be at least 8 characters"
+  : password.length > 200 ? "Password must be at most 200 characters"
+  : null;
 
 // ---------- account routes ----------
 
@@ -228,25 +232,28 @@ async function logout(request, env) {
 
 // ---------- trip routes ----------
 
-function validTrip(data) {
-  return (
-    data &&
-    typeof data.title === "string" &&
-    Array.isArray(data.days) &&
-    data.days.every(
-      (d) =>
-        typeof d.notes === "string" &&
-        Array.isArray(d.stops) &&
-        d.stops.every(
-          (s) =>
-            typeof s.location === "string" &&
-            typeof s.time === "string" &&
-            // Map-picked stops carry coordinates; typed-in stops don't.
-            (s.lat === undefined || (typeof s.lat === "number" && Math.abs(s.lat) <= 90)) &&
-            (s.lng === undefined || (typeof s.lng === "number" && Math.abs(s.lng) <= 180))
-        )
-    )
-  );
+const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
+const inRange = (n, max) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= max;
+
+// Map-picked stops carry coordinates; typed-in stops don't.
+function cleanStop(s) {
+  if (!isObj(s) || typeof s.location !== "string" || typeof s.time !== "string" || !TIME_RE.test(s.time)) return null;
+  const stop = { time: s.time, location: s.location };
+  if (s.lat === undefined && s.lng === undefined) return stop;
+  return inRange(s.lat, 90) && inRange(s.lng, 180) ? { ...stop, lat: s.lat, lng: s.lng } : null;
+}
+
+function cleanDay(d) {
+  if (!isObj(d) || typeof d.notes !== "string" || !Array.isArray(d.stops)) return null;
+  const stops = d.stops.map(cleanStop);
+  return stops.includes(null) ? null : { notes: d.notes, stops };
+}
+
+// Returns a copy with only the known fields, or null if anything is malformed.
+function cleanTrip(data) {
+  if (!isObj(data) || typeof data.title !== "string" || data.title.length > MAX_TITLE || !Array.isArray(data.days)) return null;
+  const days = data.days.map(cleanDay);
+  return days.includes(null) ? null : { title: data.title, days };
 }
 
 // Trips the user owns, plus trips they've been invited to.
@@ -268,7 +275,7 @@ async function myTrips(user, env) {
 async function createTrip(request, env, user) {
   const { title } = await request.json().catch(() => ({}));
   const data = {
-    title: String(title || "Untitled trip").slice(0, 200),
+    title: String(title || "Untitled trip").slice(0, MAX_TITLE),
     days: [{ notes: "", stops: [] }],
   };
   const id = newToken();
@@ -322,14 +329,15 @@ async function getTrip(env, tripId, user, role) {
 
 // Save: only succeeds if nobody else saved since this client loaded `version`.
 async function saveTrip(request, env, tripId) {
+  const tooLarge = () => json({ error: "Trip too large" }, 413);
+  if (Number(request.headers.get("content-length")) > MAX_BYTES) return tooLarge();
   const body = await request.text();
-  if (body.length > MAX_BYTES) return json({ error: "Trip too large" }, 413);
+  if (new TextEncoder().encode(body).length > MAX_BYTES) return tooLarge();
   let parsed;
   try { parsed = JSON.parse(body); } catch { return json({ error: "Invalid trip" }, 400); }
-  const { data, version } = parsed || {};
-  if (!validTrip(data) || !Number.isInteger(version)) {
-    return json({ error: "Invalid trip" }, 400);
-  }
+  const { data: raw, version } = parsed || {};
+  const data = cleanTrip(raw);
+  if (!data || !Number.isInteger(version)) return json({ error: "Invalid trip" }, 400);
   const result = await env.DB.prepare(
     "UPDATE trips SET data = ?, version = version + 1 WHERE edit_token = ? AND version = ?"
   )

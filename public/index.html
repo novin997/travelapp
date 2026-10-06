@@ -196,7 +196,7 @@ async function renderDashboard(username) {
   const trips = await (await fetch("/api/my-trips")).json();
   const owned = trips.filter((t) => t.role === "owner");
   const shared = trips.filter((t) => t.role !== "owner");
-  const title = el("input", { placeholder: "Trip name, e.g. Tokyo in spring" });
+  const title = el("input", { placeholder: "Trip name, e.g. Tokyo in spring", maxLength: 200 });
   const create = async (e) => {
     e.preventDefault();
     const res = await postJson("/api/trips", { title: title.value.trim() });
@@ -320,7 +320,7 @@ function renderTrip() {
     ? [
         el("p", {}, el("a", { href: "/" }, "← All trips")),
         el("input", {
-          className: "title-input", value: data.title, disabled: locked, placeholder: "Trip name",
+          className: "title-input", value: data.title, maxLength: 200, disabled: locked, placeholder: "Trip name",
           oninput: (e) => { data.title = e.target.value; document.title = data.title; scheduleSave(); },
         }),
         sharedByLine(),
