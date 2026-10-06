@@ -11,7 +11,7 @@ Private, shared travel itineraries. Everything requires logging in. Each trip (`
 - Accounts: username + password (PBKDF2-SHA256, per-user salt), 30-day HttpOnly session cookie
 - Forgot password: a one-time recovery code shown at signup (stored as SHA-256). Resetting logs out all sessions and issues a new code; logged-in users can get a new code by confirming their password
 - Deleting: only the owner can delete a trip (from My trips or the trip page)
-- Rate limiting: 5 failed login or reset attempts per username, or 20 per IP, in 15 minutes → `429` with `Retry-After`
+- Rate limiting: 5 failed login or reset attempts per username from one IP, 50 per username across all IPs, or 20 per IP, in 15 minutes → `429` with `Retry-After`. Each attempt is reserved atomically before the password is checked, so concurrent requests can't exceed the limit
 - Home page lists **My trips** and **Shared with me**
 - Sharing: the owner invites, re-roles or removes members; members can leave. Anyone without access gets `404 Trip not found` (old `/v/` links no longer work; for old `/e/` links see Legacy trips below)
 
